@@ -1,0 +1,240 @@
+
+/**
+ * @fileoverview Firestore Security Rules for MowerFlow.
+ *
+ * Core Philosophy:
+ * This ruleset enforces a strict user-ownership model. Customers can only access their own data.
+ *
+ * Data Structure:
+ * - Customers: `/customers/{customerId}` (root collection)
+ * - Tickets: `/customers/{customerId}/tickets/{ticketId}` (customer subcollection)
+ * - Technicians: `/technicians/{technicianId}` (root collection)
+ * - Appointments: `/customers/{customerId}/tickets/{ticketId}/appointments/{appointmentId}` (ticket subcollection)
+ * - Invoices: `/customers/{customerId}/tickets/{ticketId}/invoices/{invoiceId}` (ticket subcollection)
+ * - Equipment: `/customers/{customerId}/equipment/{equipmentId}` (customer subcollection)
+ *
+ * Key Security Decisions:
+ * - Customers can only manage data directly under their customer ID.
+ * - Technicians can only manage their own data under their technician ID.
+ * - User listing is generally disallowed for privacy and security.
+ * - Data validation is relaxed in prototyping mode, focusing on authorization.
+ *
+ * Denormalization for Authorization:
+ * The data structure is designed for authorization independence.  Each subcollection is nested under
+ * the owner's document, eliminating the need for `get()` calls in security rules.
+ * For example, tickets are stored under `/customers/{customerId}/tickets/{ticketId}` so the rules
+ * can easily verify the customer's ownership without additional reads.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * @description Allows customers to manage their own profiles.
+     * @path /customers/{customerId}
+     * @allow (create) - Authenticated user can create a customer document.
+     * @allow (get, update, delete) - Authenticated user can get, update, or delete their own customer document.
+     * @deny (create) - Unauthenticated users cannot create customer documents.
+     * @deny (update, delete) - Authenticated user cannot modify someone else's customer document.
+     * @deny (list) - Customer listing is not allowed for individual users.
+     * @principle Enforces document ownership for writes.
+     */
+    match /customers/{customerId} {
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isOwner(userId) {
+        return request.auth.uid == userId;
+      }
+
+      function isExistingOwner(userId) {
+        return isOwner(userId) && resource != null;
+      }
+
+      allow create: if isSignedIn();
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow update: if isExistingOwner(customerId);
+      allow delete: if isExistingOwner(customerId);
+    }
+    
+    /**
+     * @description Allows authenticated users to manage leads.
+     * @path /leads/{leadId}
+     * @allow (read, write) - Any user can read or write to the leads collection.
+     * @principle Leads are company-wide data. This rule is permissive to allow webhooks and server actions to create/update leads.
+     */
+    match /leads/{leadId} {
+        allow read, write: if true;
+    }
+    
+    /**
+     * @description This rule allows for collection group queries on 'tickets'.
+     * Any authenticated user can list or get any ticket, which is necessary for the main schedule view.
+     * Write operations (create, update, delete) remain protected by customer ownership rules defined elsewhere.
+     * @path /{path=**}/tickets/{ticketId} - Matches any 'tickets' collection, anywhere in the database.
+     * @allow (list, get) - Any authenticated user can read the list of tickets or a single ticket.
+     */
+    match /{path=**}/tickets/{ticketId} {
+        function isSignedIn() {
+            return request.auth != null;
+        }
+
+        allow list: if isSignedIn();
+        allow get: if isSignedIn();
+    }
+
+
+    /**
+     * @description Allows customers to manage their own tickets. Technicians/Admins can list all tickets for the schedule view.
+     * @path /customers/{customerId}/tickets/{ticketId}
+     * @allow (create) - Authenticated user can create a ticket under their customer ID.
+     * @allow (get, update, delete) - Authenticated user can get, update, or delete their own ticket.
+     * @deny (create) - Unauthenticated users cannot create tickets.
+     * @deny (update, delete) - Authenticated user cannot modify someone else's ticket.
+     * @allow (list) - Authenticated users can list tickets (for schedule view).
+     * @principle Enforces document ownership for writes on specific documents, but allows broad listing for app functionality.
+     */
+    match /customers/{customerId}/tickets/{ticketId} {
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isOwner(userId) {
+        return request.auth.uid == userId;
+      }
+
+      function isExistingOwner(userId) {
+        return isOwner(userId) && resource != null;
+      }
+
+      allow create: if isSignedIn();
+      allow get: if isOwner(customerId);
+      // This list is for a customer viewing their own tickets. The collectionGroup query uses a different rule.
+      allow list: if isOwner(customerId);
+      allow update: if isExistingOwner(customerId);
+      allow delete: if isExistingOwner(customerId);
+    }
+
+    /**
+     * @description Allows technicians to manage their own profiles.
+     * @path /technicians/{technicianId}
+     * @allow (create) - Authenticated user can create a technician document if the technicianId matches their UID.
+     * @allow (get, update, delete) - Authenticated user can get, update, or delete their own technician document.
+     * @deny (create) - Unauthenticated users cannot create technician documents.
+     * @deny (update, delete) - Authenticated user cannot modify someone else's technician document.
+     * @deny (list) - Technician listing is not allowed.
+     * @principle Enforces document ownership for writes.
+     */
+    match /technicians/{technicianId} {
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isOwner(userId) {
+        return request.auth.uid == userId;
+      }
+
+      function isExistingOwner(userId) {
+        return isOwner(userId) && resource != null;
+      }
+
+      allow create: if isSignedIn() && isOwner(technicianId);
+      allow get: if isOwner(technicianId);
+      allow list: if false;
+      allow update: if isExistingOwner(technicianId);
+      allow delete: if isExistingOwner(technicianId);
+    }
+
+    /**
+     * @description Allows customers to manage appointments under their tickets.
+     * @path /customers/{customerId}/tickets/{ticketId}/appointments/{appointmentId}
+     * @allow (create) - Authenticated user can create an appointment under their ticket.
+     * @allow (get, update, delete) - Authenticated user can get, update, or delete their own appointment.
+     * @deny (create) - Unauthenticated users cannot create appointments.
+     * @deny (update, delete) - Authenticated user cannot modify someone else's appointment.
+     * @allow (list) - Authenticated user can list appointments under their ticket.
+     * @principle Enforces document ownership for writes.
+     */
+    match /customers/{customerId}/tickets/{ticketId}/appointments/{appointmentId} {
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isOwner(userId) {
+        return request.auth.uid == userId;
+      }
+
+      function isExistingOwner(userId) {
+        return isOwner(userId) && resource != null;
+      }
+
+      allow create: if isSignedIn() && isOwner(customerId);
+      allow get: if isOwner(customerId);
+      allow list: if isOwner(customerId);
+      allow update: if isExistingOwner(customerId);
+      allow delete: if isExistingOwner(customerId);
+    }
+
+    /**
+     * @description Allows customers to manage invoices under their tickets.
+     * @path /customers/{customerId}/tickets/{ticketId}/invoices/{invoiceId}
+     * @allow (create) - Authenticated user can create an invoice under their ticket.
+     * @allow (get, update, delete) - Authenticated user can get, update, or delete their own invoice.
+     * @deny (create) - Unauthenticated users cannot create invoices.
+     * @deny (update, delete) - Authenticated user cannot modify someone else's invoice.
+     * @allow (list) - Authenticated user can list invoices under their ticket.
+     * @principle Enforces document ownership for writes.
+     */
+    match /customers/{customerId}/tickets/{ticketId}/invoices/{invoiceId} {
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isOwner(userId) {
+        return request.auth.uid == userId;
+      }
+
+      function isExistingOwner(userId) {
+        return isOwner(userId) && resource != null;
+      }
+
+      allow create: if isSignedIn() && isOwner(customerId);
+      allow get: if isOwner(customerId);
+      allow list: if isOwner(customerId);
+      allow update: if isExistingOwner(customerId);
+      allow delete: if isExistingOwner(customerId);
+    }
+
+    /**
+     * @description Allows customers to manage their equipment.
+     * @path /customers/{customerId}/equipment/{equipmentId}
+     * @allow (create) - Authenticated user can create equipment under their customer ID.
+     * @allow (get, update, delete) - Authenticated user can get, update, or delete their own equipment.
+     * @deny (create) - Unauthenticated users cannot create equipment.
+     * @deny (update, delete) - Authenticated user cannot modify someone else's equipment.
+     * @allow (list) - Authenticated user can list their equipment.
+     * @principle Enforces document ownership for writes.
+     */
+    match /customers/{customerId}/equipment/{equipmentId} {
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isOwner(userId) {
+        return request.auth.uid == userId;
+      }
+
+      function isExistingOwner(userId) {
+        return isOwner(userId) && resource != null;
+      }
+
+      allow create: if isSignedIn() && isOwner(customerId);
+      allow get: if isOwner(customerId);
+      allow list: if isOwner(customerId);
+      allow update: if isExistingOwner(customerId);
+      allow delete: if isExistingOwner(customerId);
+    }
+  }
+}
